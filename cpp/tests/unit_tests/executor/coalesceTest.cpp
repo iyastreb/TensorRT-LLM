@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/stridedTransfer.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <gtest/gtest.h>
 
@@ -40,6 +41,97 @@ std::pair<MemoryDescs, MemoryDescs> run(TransferDescs const& src, TransferDescs 
     return VmmDescSplitter::splitAndCoalesceTransferDescs(src, dst, localMap, remoteMap);
 }
 } // namespace
+
+TEST(StridedTransferLayoutTest, ReusesGridsForReorderedAndRepeatedBlocks)
+{
+    detail::StridedTransferLayout layout;
+    auto const regions = flatRegion(0x1000, 0x100);
+    auto indices
+        = layout.makeIndices(std::vector<MemoryDesc>{{0x1070, 16, 0}, {0x1010, 16, 0}, {0x1070, 16, 0}}, regions);
+    ASSERT_TRUE(indices);
+    EXPECT_EQ(*indices, (std::vector<int>{7, 1, 7}));
+    indices = layout.findIndices(std::vector<MemoryDesc>{{0x1040, 16, 0}, {0x1020, 16, 0}, {0x1010, 16, 0}}, regions);
+    ASSERT_TRUE(indices);
+    EXPECT_EQ(*indices, (std::vector<int>{4, 2, 1}));
+    ASSERT_EQ(layout.getRuns().size(), 1u);
+    EXPECT_EQ(layout.getRuns()[0].count, 16u);
+}
+
+TEST(StridedTransferLayoutTest, SelectsAlignedBlocksWithinVmmChunks)
+{
+    detail::StridedTransferLayout layout;
+    VramRegionMap const regions{{0x1000, {0x180, 0x100}}};
+    std::vector<MemoryDesc> const descs{
+        {0x10C0, 0x40, 0}, {0x1100, 0x40, 0}, {0x1010, 0x20, 0}, {0x1010, 0x20, 1}, {0x1160, 0x20, 1}};
+    auto const indices = layout.makeIndices(descs, regions);
+    ASSERT_TRUE(indices);
+    std::vector<MemoryDesc> expanded;
+    for (auto const& run : layout.getRuns())
+    {
+        EXPECT_LE(run.addr + (run.count - 1) * run.stride + run.len, run.addr < 0x1100 ? 0x1100u : 0x1180u);
+        for (size_t index = 0; index < run.count; ++index)
+        {
+            expanded.emplace_back(run.addr + index * run.stride, run.len, run.deviceId);
+        }
+    }
+    ASSERT_EQ(indices->size(), descs.size());
+    for (size_t index = 0; index < descs.size(); ++index)
+    {
+        auto const& selected = expanded.at(indices->at(index));
+        EXPECT_EQ(selected.getAddr(), descs[index].getAddr());
+        EXPECT_EQ(selected.getLen(), descs[index].getLen());
+        EXPECT_EQ(selected.getDeviceId(), descs[index].getDeviceId());
+    }
+}
+
+TEST(StridedTransferLayoutTest, RejectsInvalidExtentsAndIndexOverflow)
+{
+    detail::StridedTransferLayout layout;
+    VramRegionMap const regions{{0x1000, {0x200, 0x100}}};
+    for (auto const& desc :
+        std::vector<MemoryDesc>{{0xFFF, 1, 0}, {0x1000, 0, 0}, {0x1200, 1, 0}, {0x10F0, 32, 0}, {0x11F0, 32, 0}})
+    {
+        EXPECT_FALSE(layout.makeIndices(std::vector{desc}, regions));
+    }
+    constexpr auto kMaxAddr = std::numeric_limits<uintptr_t>::max();
+    EXPECT_FALSE(layout.makeIndices(std::vector<MemoryDesc>{{kMaxAddr - 7, 4, 0}}, flatRegion(kMaxAddr - 15, 32)));
+    auto const tooManyIndices = static_cast<size_t>(std::numeric_limits<int>::max()) + 1;
+    EXPECT_FALSE(layout.makeIndices(std::vector<MemoryDesc>{{0x1000, 1, 0}}, flatRegion(0x1000, tooManyIndices)));
+    EXPECT_TRUE(layout.getRuns().empty());
+}
+
+TEST(StridedTransferLayoutTest, IndexesEveryChunkOfTheRegionAtOnce)
+{
+    detail::StridedTransferLayout layout;
+    VramRegionMap const regions{{0x1000, {0x180, 0x100}}};
+    ASSERT_TRUE(layout.makeIndices(std::vector<MemoryDesc>{{0x1040, 0x40, 0}}, regions));
+    ASSERT_EQ(layout.getRuns().size(), 2u);
+    EXPECT_EQ(layout.getRuns()[1].addr, 0x1100u);
+    EXPECT_EQ(layout.getRuns()[1].count, 2u);
+    auto const indices = layout.findIndices(std::vector<MemoryDesc>{{0x1140, 0x40, 0}, {0x10C0, 0x40, 0}}, regions);
+    ASSERT_TRUE(indices);
+    EXPECT_EQ(*indices, (std::vector<int>{5, 3}));
+}
+
+TEST(StridedTransferLayoutTest, BoundsGridsPerRegionAndTheIndexSpace)
+{
+    constexpr auto kMaxGrids = detail::StridedTransferLayout::kMaxGridsPerRegion;
+    detail::StridedTransferLayout layout;
+    auto regions = flatRegion(0x1000, 0x1000);
+    regions[0x9000] = {0x1000, 0};
+    for (size_t phase = 0; phase < kMaxGrids; ++phase)
+    {
+        ASSERT_TRUE(layout.makeIndices(std::vector<MemoryDesc>{{0x1000 + phase, 64, 0}}, regions));
+    }
+    EXPECT_FALSE(layout.makeIndices(std::vector<MemoryDesc>{{0x1000 + kMaxGrids, 64, 0}}, regions));
+    EXPECT_TRUE(layout.makeIndices(std::vector<MemoryDesc>{{0x9000, 64, 0}}, regions));
+    EXPECT_EQ(layout.getRuns().size(), kMaxGrids + 1);
+
+    detail::StridedTransferLayout large;
+    auto const half = flatRegion(0x1000, static_cast<size_t>(std::numeric_limits<int>::max()) / 2 + 1);
+    EXPECT_TRUE(large.makeIndices(std::vector<MemoryDesc>{{0x1000, 1, 0}}, half));
+    EXPECT_FALSE(large.makeIndices(std::vector<MemoryDesc>{{0x1000, 1, 1}}, half));
+}
 
 // ==================== coalescing within flat regions (chunkSize=0) ====================
 

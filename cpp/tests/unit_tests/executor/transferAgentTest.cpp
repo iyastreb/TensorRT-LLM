@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <filesystem>
+#include <numeric>
 #include <thread>
 #include <vector>
 
@@ -231,49 +232,78 @@ TEST_P(TransferAgentTest, Basic2)
 
 TEST_P(TransferAgentTest, DeviceMemory)
 {
-
     std::string const agent0{"agent0"}, agent1{"agent1"};
     BaseAgentConfig config0{agent0, true, false, true}, config1{agent1, true, false, true};
     auto xferAgent0 = makeTransferAgent(config0);
     auto xferAgent1 = makeTransferAgent(config1);
-
-    TLLM_CHECK(xferAgent0);
-    TLLM_CHECK(xferAgent1);
-    char* dev_ptr0;
-    char* dev_ptr1;
-    size_t size = 100;
-    uint32_t deviceId = 0;
-    cudaMalloc(&dev_ptr0, size);
-    cudaMalloc(&dev_ptr1, size);
-    std::vector<char> memory0(size, 10);
-    std::vector<char> memory1(size, 1);
-    TLLM_CUDA_CHECK(cudaMemcpy(dev_ptr0, memory0.data(), size, cudaMemcpyHostToDevice));
-    TLLM_CUDA_CHECK(cudaMemcpy(dev_ptr1, memory1.data(), size, cudaMemcpyHostToDevice));
-    RegisteredHostMemory regMem0(
-        MemoryDescs{MemoryType::kVRAM, {MemoryDesc{dev_ptr0, size, deviceId}}}, xferAgent0.get());
-    RegisteredHostMemory regMem1(
-        MemoryDescs{MemoryType::kVRAM, {MemoryDesc{dev_ptr1, size, deviceId}}}, xferAgent1.get());
-
-    // xferAgent0->loadRemoteAgent(agent1);
-    auto connectionInfo = xferAgent1->getLocalConnectionInfo();
-    xferAgent0->loadRemoteAgent(agent1, connectionInfo);
-    bool checked = false;
-    do
+    ASSERT_TRUE(xferAgent0);
+    ASSERT_TRUE(xferAgent1);
+    constexpr size_t kSize = 128;
+    constexpr size_t kBlockSize = 8;
+    char* device0;
+    char* device1;
+    TLLM_CUDA_CHECK(cudaMalloc(&device0, kSize));
+    TLLM_CUDA_CHECK(cudaMalloc(&device1, kSize));
+    std::vector<char> memory0(kSize), memory1(kSize, -1), actual0(kSize), actual1(kSize);
+    std::iota(memory0.begin(), memory0.end(), char{0});
+    TLLM_CUDA_CHECK(cudaMemcpy(device0, memory0.data(), kSize, cudaMemcpyHostToDevice));
+    TLLM_CUDA_CHECK(cudaMemcpy(device1, memory1.data(), kSize, cudaMemcpyHostToDevice));
     {
-        checked = xferAgent0->checkRemoteDescs(agent1, regMem1.getDescs());
-    } while (!checked);
-    TransferRequest writeReq{TransferOp::kWRITE, regMem0.getDescs(), regMem1.getDescs(), agent1};
-    auto status = xferAgent0->submitTransferRequests(writeReq);
-    TLLM_CHECK(status->wait() == TransferState::kSUCCESS);
-
-    TLLM_CUDA_CHECK(cudaMemcpy(memory0.data(), dev_ptr0, size, cudaMemcpyDeviceToHost));
-    TLLM_CUDA_CHECK(cudaMemcpy(memory1.data(), dev_ptr1, size, cudaMemcpyDeviceToHost));
-
-    TLLM_CHECK(memory0 == memory1);
-
-    TLLM_CUDA_CHECK(cudaFree(dev_ptr0));
-    TLLM_CUDA_CHECK(cudaFree(dev_ptr1));
-    xferAgent0->invalidateRemoteAgent(agent1);
+        RegisteredHostMemory regMem0(MemoryDescs{MemoryType::kVRAM, {MemoryDesc{device0, kSize, 0}}}, xferAgent0.get());
+        RegisteredHostMemory regMem1(MemoryDescs{MemoryType::kVRAM, {MemoryDesc{device1, kSize, 0}}}, xferAgent1.get());
+        auto const loadRemote = [&]
+        {
+            if (backend == "nixl")
+            {
+                xferAgent0->loadRemoteAgent(agent1, xferAgent1->getLocalAgentDesc());
+            }
+            else
+            {
+                xferAgent0->loadRemoteAgent(agent1, xferAgent1->getLocalConnectionInfo());
+            }
+            while (!xferAgent0->checkRemoteDescs(agent1, regMem1.getDescs()))
+            {
+            }
+        };
+        loadRemote();
+        for (size_t round = 0; round < 3; ++round)
+        {
+            if (round == 1)
+            {
+                xferAgent0->invalidateRemoteAgent(agent1);
+                loadRemote();
+            }
+            for (auto const op : {TransferOp::kWRITE, TransferOp::kREAD})
+            {
+                std::vector<MemoryDesc> local, remote;
+                for (size_t block : {3, 0, 5})
+                {
+                    auto const localOffset = (block + round) * kBlockSize;
+                    auto const remoteOffset = (2 * block + round + (op == TransferOp::kREAD ? 1 : 0)) * kBlockSize;
+                    local.emplace_back(device0 + localOffset, kBlockSize, 0);
+                    remote.emplace_back(device1 + remoteOffset, kBlockSize, 0);
+                    if (op == TransferOp::kWRITE)
+                    {
+                        std::copy_n(memory0.begin() + localOffset, kBlockSize, memory1.begin() + remoteOffset);
+                    }
+                    else
+                    {
+                        std::copy_n(memory1.begin() + remoteOffset, kBlockSize, memory0.begin() + localOffset);
+                    }
+                }
+                TransferRequest request{op, {MemoryType::kVRAM, local}, {MemoryType::kVRAM, remote}, agent1};
+                auto const status = xferAgent0->submitTransferRequests(request);
+                ASSERT_EQ(status->wait(), TransferState::kSUCCESS);
+                TLLM_CUDA_CHECK(cudaMemcpy(actual0.data(), device0, kSize, cudaMemcpyDeviceToHost));
+                TLLM_CUDA_CHECK(cudaMemcpy(actual1.data(), device1, kSize, cudaMemcpyDeviceToHost));
+                EXPECT_EQ(actual0, memory0);
+                EXPECT_EQ(actual1, memory1);
+            }
+        }
+        xferAgent0->invalidateRemoteAgent(agent1);
+    }
+    TLLM_CUDA_CHECK(cudaFree(device0));
+    TLLM_CUDA_CHECK(cudaFree(device1));
 }
 
 TEST_P(TransferAgentTest, Connect)

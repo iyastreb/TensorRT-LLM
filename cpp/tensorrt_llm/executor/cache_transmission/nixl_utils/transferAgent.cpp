@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/ipUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/stridedTransfer.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
@@ -40,6 +41,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <thread>
+#include <tuple>
 #include <unistd.h>
 #include <vector>
 
@@ -55,6 +57,86 @@
 
 namespace tensorrt_llm::executor::kv_cache
 {
+
+struct NixlTransferAgent::PreparedTransfer
+{
+    class Side
+    {
+    public:
+        Side(nixlAgent& rawAgent, detail::StridedTransferLayout layout)
+            : mRawAgent(rawAgent)
+            , mLayout(std::move(layout))
+        {
+        }
+
+        ~Side()
+        {
+            if (mHandle != nullptr)
+            {
+                (void) mRawAgent.releasedDlistH(mHandle);
+            }
+        }
+
+        Side(Side const&) = delete;
+        Side& operator=(Side const&) = delete;
+
+        [[nodiscard]] detail::StridedTransferLayout const& getLayout() const
+        {
+            return mLayout;
+        }
+
+        [[nodiscard]] nixlDlistH* getHandle() const
+        {
+            return mHandle;
+        }
+
+        nixl_status_t prepare(std::string const& name, nixl_opt_args_t const* params)
+        {
+            TLLM_CHECK(mHandle == nullptr);
+            nixl_stride_dlist_t descs{VRAM_SEG};
+            descs.reserve(mLayout.getRuns().size());
+            for (auto const& run : mLayout.getRuns())
+            {
+                descs.addDesc(nixlStrideDesc{run.addr, run.len, run.deviceId, run.stride, run.count});
+            }
+            return mRawAgent.prepXferDlist(name, descs, mHandle, params);
+        }
+
+        //! For the descriptors of one request: flat index i is descriptor i.
+        nixl_status_t prepare(std::string const& name, nixl_xfer_dlist_t const& descs, nixl_opt_args_t const* params)
+        {
+            TLLM_CHECK(mHandle == nullptr);
+            return mRawAgent.prepXferDlist(name, descs, mHandle, params);
+        }
+
+    private:
+        nixlAgent& mRawAgent;
+        detail::StridedTransferLayout mLayout;
+        nixlDlistH* mHandle{};
+    };
+
+    std::unique_ptr<Side> local;
+    std::unique_ptr<Side> remote;
+
+    static bool prepare(nixlAgent& rawAgent, std::unique_ptr<Side>& side, detail::StridedTransferLayout layout,
+        std::string const& name, nixl_opt_args_t const* params)
+    {
+        if (side && side->getLayout().getRuns().size() == layout.getRuns().size())
+        {
+            return true;
+        }
+        auto replacement = std::make_unique<Side>(rawAgent, std::move(layout));
+        auto const status = replacement->prepare(name, params);
+        if (status == NIXL_ERR_NOT_FOUND)
+        {
+            return false;
+        }
+        TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS, "prepXferDlist for %s failed: %s", name.c_str(),
+            nixlEnumStrings::statusStr(status).c_str());
+        side = std::move(replacement);
+        return true;
+    }
+};
 
 // ============================================================================
 // Bounce v2 integration (opt-in via CacheTransceiverConfig.kv_cache_bounce_size_mb > 0). When disabled,
@@ -891,6 +973,7 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         TLLM_THROW("Failed to create NIXL backend: %s", nixlBackend.c_str());
     }
     mExtraParams.backends.push_back(mRawBackend);
+    mExtraParams.skipDescMerge = common::getEnvNixlDisableCoalesce();
     TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent mAddress: %s", mAddress.c_str());
 
     // Bring up bounce v2 now, if enabled, so its shared arena is registered before any peer fetches
@@ -902,6 +985,7 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
 {
     std::unique_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::registerMemory called after shutdown");
+    mPreparedTransfers.clear();
     // Split VRAM descriptors at VMM chunk boundaries so each sub-descriptor
     // falls within a single cuMemCreate allocation (required by gdr_copy / cuda_ipc).
     size_t detectedChunkSize = 0;
@@ -924,6 +1008,7 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
 {
     std::unique_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::deregisterMemory called after shutdown");
+    mPreparedTransfers.clear();
     // Split using per-region registry info to match what was registered
     auto splitDescs = VmmDescSplitter::splitDescsWithRegionMap(descs, mLocalVramRegionInfo);
 
@@ -945,6 +1030,8 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const
 {
     std::unique_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::loadRemoteAgent called after shutdown");
+    mPreparedTransfers.erase(name);
+    mRemoteVramRegionInfo.erase(name);
     nixl_status_t status;
     std::string remoteName;
     status = mRawAgent->loadRemoteMD(agentDesc.getBackendAgentDesc(), remoteName);
@@ -1013,6 +1100,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         return;
     }
     // Clean up remote VMM region info before invalidating the remote agent.
+    mPreparedTransfers.erase(name);
     mRemoteVramRegionInfo.erase(name);
 #ifdef TLLM_BOUNCE_V2
     // Drop bounce credits and in-flight requests tied to this peer so it cannot retain receiver
@@ -1052,6 +1140,11 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     }
 #endif
 
+    if (auto status = trySubmitPreparedTransfer(request))
+    {
+        return status;
+    }
+
     // Split transfer descriptors at VMM chunk boundaries to match registered memory, then coalesce
     // contiguous pieces. A coalesced descriptor never crosses a chunk boundary or a registered
     // region boundary on either side, so every descriptor still falls within a single registered
@@ -1069,9 +1162,119 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 
     auto status = postXferRequest(request.getOp(), xferSrc, xferDst, request.getRemoteName(), request.getSyncMessage());
     TLLM_CHECK_WITH_INFO(status != nullptr,
-        " rank: %d createXferReq failed (see warning above) selfname: %s remoteAgent name: %s", mRank, mName.c_str(),
+        " rank: %d makeXferReq failed (see warning above) selfname: %s remoteAgent name: %s", mRank, mName.c_str(),
         request.getRemoteName().c_str());
     return status;
+}
+
+std::unique_ptr<TransferStatus> NixlTransferAgent::trySubmitPreparedTransfer(TransferRequest const& request)
+{
+    auto const& src = request.getSrcDescs();
+    auto const& dst = request.getDstDescs();
+    auto const remoteIt = mRemoteVramRegionInfo.find(request.getRemoteName());
+    if (src.getType() != MemoryType::kVRAM || dst.getType() != MemoryType::kVRAM || src.getDescs().empty()
+        || src.getDescs().size() != dst.getDescs().size()
+        || src.getDescs().size() > static_cast<size_t>(std::numeric_limits<int>::max()) || mLocalVramRegionInfo.empty()
+        || remoteIt == mRemoteVramRegionInfo.end() || remoteIt->second.empty())
+    {
+        return nullptr;
+    }
+    for (size_t i = 0; i < src.getDescs().size(); ++i)
+    {
+        if (src.getDescs()[i].getLen() != dst.getDescs()[i].getLen())
+        {
+            return nullptr;
+        }
+    }
+
+    std::unique_lock<std::mutex> cacheLock(mPreparedTransfersMutex);
+    auto& cached = mPreparedTransfers[request.getRemoteName()];
+    if (!cached)
+    {
+        cached = std::make_unique<PreparedTransfer>();
+    }
+    auto selectIndices = [](auto const& side, auto const& descs, auto const& regions, auto& pending)
+    {
+        auto indices = side ? side->getLayout().findIndices(descs, regions) : std::nullopt;
+        if (!indices)
+        {
+            if (side)
+            {
+                pending.emplace(side->getLayout());
+            }
+            else
+            {
+                pending.emplace();
+            }
+            indices = pending->makeIndices(descs, regions);
+        }
+        return indices;
+    };
+    std::optional<detail::StridedTransferLayout> localLayout, remoteLayout;
+    auto localIndices = selectIndices(cached->local, src.getDescs(), mLocalVramRegionInfo, localLayout);
+    auto remoteIndices = selectIndices(cached->remote, dst.getDescs(), remoteIt->second, remoteLayout);
+    if (!localIndices || !remoteIndices)
+    {
+        return nullptr;
+    }
+    if ((localLayout
+            && !PreparedTransfer::prepare(
+                *mRawAgent, cached->local, std::move(*localLayout), NIXL_INIT_AGENT, &mExtraParams))
+        || (remoteLayout
+            && !PreparedTransfer::prepare(
+                *mRawAgent, cached->remote, std::move(*remoteLayout), request.getRemoteName(), &mExtraParams)))
+    {
+        return nullptr;
+    }
+
+    nixl_opt_args_t params = mExtraParams;
+    params.skipDescMerge = common::getEnvNixlDisableCoalesce();
+    if (!params.skipDescMerge
+        && !std::is_sorted(src.getDescs().begin(), src.getDescs().end(),
+            [](auto const& left, auto const& right)
+            {
+                return std::make_tuple(left.getDeviceId(), left.getAddr())
+                    < std::make_tuple(right.getDeviceId(), right.getAddr());
+            }))
+    {
+        std::vector<std::tuple<uint32_t, uintptr_t, int, int>> ordered;
+        ordered.reserve(src.getDescs().size());
+        for (size_t i = 0; i < src.getDescs().size(); ++i)
+        {
+            ordered.emplace_back(
+                src.getDescs()[i].getDeviceId(), src.getDescs()[i].getAddr(), (*localIndices)[i], (*remoteIndices)[i]);
+        }
+        std::sort(ordered.begin(), ordered.end(),
+            [](auto const& left, auto const& right) {
+                return std::tie(std::get<0>(left), std::get<1>(left))
+                    < std::tie(std::get<0>(right), std::get<1>(right));
+            });
+        for (size_t i = 0; i < ordered.size(); ++i)
+        {
+            (*localIndices)[i] = std::get<2>(ordered[i]);
+            (*remoteIndices)[i] = std::get<3>(ordered[i]);
+        }
+    }
+    if (request.getSyncMessage())
+    {
+        params.hasNotif = true;
+        params.notifMsg = request.getSyncMessage().value();
+    }
+    nixlXferReqH* handle = nullptr;
+    auto const status = mRawAgent->makeXferReq(NixlHelper::convert(request.getOp()), cached->local->getHandle(),
+        localIndices.value(), cached->remote->getHandle(), remoteIndices.value(), handle, &params);
+    if (status != NIXL_SUCCESS)
+    {
+        if (handle != nullptr)
+        {
+            (void) mRawAgent->releaseXferReq(handle);
+        }
+        mPreparedTransfers.erase(request.getRemoteName());
+    }
+    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS, "makeXferReq to %s failed: %s", request.getRemoteName().c_str(),
+        nixlEnumStrings::statusStr(status).c_str());
+    cacheLock.unlock();
+    return postPreparedTransfer(handle, request.getRemoteName(), &params);
 }
 
 std::unique_ptr<TransferStatus> NixlTransferAgent::postXferRequest(TransferOp op, TransferDescs const& srcDescs,
@@ -1096,13 +1299,28 @@ std::unique_ptr<TransferStatus> NixlTransferAgent::postXferRequest(TransferOp op
     nixl_status_t status;
     nixlXferReqH* handle = nullptr;
     {
-        NVTX3_SCOPED_RANGE(createXferReq);
-        status = mRawAgent->createXferReq(NixlHelper::convert(op), NixlHelper::convertXferDist(srcDescs),
-            NixlHelper::convertXferDist(dstDescs), remoteName, handle, reqParams);
+        NVTX3_SCOPED_RANGE(makeXferReq);
+        // Lists for this request alone; makeXferReq copies the descriptors it selects.
+        PreparedTransfer::Side local(*mRawAgent, {});
+        PreparedTransfer::Side remote(*mRawAgent, {});
+        std::vector<int> indices(srcDescs.getDescs().size());
+        std::iota(indices.begin(), indices.end(), 0);
+        status = indices.size() == dstDescs.getDescs().size()
+            ? local.prepare(NIXL_INIT_AGENT, NixlHelper::convertXferDist(srcDescs), reqParams)
+            : NIXL_ERR_INVALID_PARAM;
+        if (status == NIXL_SUCCESS)
+        {
+            status = remote.prepare(remoteName, NixlHelper::convertXferDist(dstDescs), reqParams);
+        }
+        if (status == NIXL_SUCCESS)
+        {
+            status = mRawAgent->makeXferReq(
+                NixlHelper::convert(op), local.getHandle(), indices, remote.getHandle(), indices, handle, reqParams);
+        }
     }
     if (status != NIXL_SUCCESS)
     {
-        TLLM_LOG_WARNING("NixlTransferAgent(%s): createXferReq to %s failed: %s", mName.c_str(), remoteName.c_str(),
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): makeXferReq to %s failed: %s", mName.c_str(), remoteName.c_str(),
             nixlEnumStrings::statusStr(status).c_str());
         if (handle != nullptr)
         {
@@ -1110,9 +1328,16 @@ std::unique_ptr<TransferStatus> NixlTransferAgent::postXferRequest(TransferOp op
         }
         return nullptr;
     }
+    return postPreparedTransfer(handle, remoteName, reqParams);
+}
+
+std::unique_ptr<TransferStatus> NixlTransferAgent::postPreparedTransfer(
+    nixlXferReqH* handle, std::string const& remoteName, nixl_opt_args_t const* params)
+{
+    nixl_status_t status;
     {
         NVTX3_SCOPED_RANGE(postXferReq);
-        status = mRawAgent->postXferReq(handle, reqParams);
+        status = mRawAgent->postXferReq(handle, params);
     }
     if (status != NIXL_SUCCESS && status != NIXL_IN_PROG)
     {
@@ -1188,6 +1413,8 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoT
 {
     std::unique_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::loadRemoteAgent called after shutdown");
+    mPreparedTransfers.erase(name);
+    mRemoteVramRegionInfo.erase(name);
     // Bounce bootstrap is handled on the AgentDesc overload, which is the production path.
     auto const separator = connectionInfo.rfind(':');
     TLLM_CHECK_WITH_INFO(separator != std::string::npos,
@@ -1265,6 +1492,7 @@ void NixlTransferAgent::shutdown() noexcept
     mBounce.reset();
 #endif
 
+    mPreparedTransfers.clear();
     if (mRawAgent)
     {
         // Inline invalidate: invalidateRemoteAgent() would re-enter the non-recursive lock.

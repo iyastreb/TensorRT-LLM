@@ -123,7 +123,7 @@ public:
     [[nodiscard]] std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) override;
 
     // ---- Low-level transfer primitives (below the VMM splitter) -------------------------------
-    // submitTransferRequests() = bounce fork + VMM split/coalesce + postXferRequest(). The bounce
+    // submitTransferRequests() uses bounce, prepared layouts, or VMM splitting + postXferRequest(). The bounce
     // transport calls these directly: its remote address comes from a credit (already final, no
     // VMM resolution) and its per-chunk cadence cannot afford the full public path. Virtual so
     // bounce failure tests can inject deterministic transfer faults.
@@ -225,6 +225,15 @@ private:
     /// Remote VMM region info (from loadRemoteAgent). Keyed by {agentName → {addr → info}}.
     /// Per-agent maps because different remote agents may have overlapping virtual addresses.
     std::unordered_map<std::string, VramRegionMap> mRemoteVramRegionInfo;
+
+    struct PreparedTransfer;
+    std::unordered_map<std::string, std::unique_ptr<PreparedTransfer>> mPreparedTransfers;
+    // mLock protects cache lifetime; this mutex serializes concurrent submitters.
+    std::mutex mPreparedTransfersMutex;
+
+    [[nodiscard]] std::unique_ptr<TransferStatus> trySubmitPreparedTransfer(TransferRequest const& request);
+    [[nodiscard]] std::unique_ptr<TransferStatus> postPreparedTransfer(
+        nixlXferReqH* handle, std::string const& remoteName, nixl_opt_args_t const* params);
 
     /// Bounce v2 transport (opt-in via CacheTransceiverConfig.kv_cache_bounce_size_mb > 0). Null
     /// unless enabled & built; when null the agent behaves exactly as before. See the design overview
